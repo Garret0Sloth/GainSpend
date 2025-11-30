@@ -2,7 +2,7 @@ import os
 import logging
 from datetime import datetime, date
 
-import psycopg2
+import psycopg
 from telegram import (
     Update,
     ReplyKeyboardMarkup,
@@ -63,7 +63,7 @@ CATEGORY_EMOJI = {
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 def get_conn():
-    return psycopg2.connect(DATABASE_URL, sslmode="require")
+    return psycopg.connect(DATABASE_URL, sslmode="require")
 
 
 # -------------------------------------------------------------
