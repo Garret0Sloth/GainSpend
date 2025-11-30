@@ -40,11 +40,6 @@ logger = logging.getLogger(__name__)
 ) = range(7)
 
 # -------------------------------------------------------------
-# НАСТРОЙКИ ДОСТУПА
-# -------------------------------------------------------------
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))  # твой Telegram ID
-
-# -------------------------------------------------------------
 # КАТЕГОРИИ И ЭМОДЗИ
 # -------------------------------------------------------------
 EXPENSE_CATEGORIES = ["Еда", "Дом", "Коммуналка", "Досуг", "НЗ"]
@@ -58,57 +53,44 @@ CATEGORY_EMOJI = {
 }
 
 # -------------------------------------------------------------
-# ПОДКЛЮЧЕНИЕ К БАЗЕ POSTGRESQL (Railway)
+# БАЗА ДАННЫХ (PostgreSQL)
 # -------------------------------------------------------------
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+
 def get_conn():
+    if not DATABASE_URL:
+        raise RuntimeError("Не задана переменная окружения DATABASE_URL")
     return psycopg.connect(DATABASE_URL, sslmode="require")
 
 
-# -------------------------------------------------------------
-# СОЗДАНИЕ ТАБЛИЦ
-# -------------------------------------------------------------
 def init_db():
     conn = get_conn()
     cur = conn.cursor()
-
-    # Таблица с доходами/расходами
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS records (
             id BIGSERIAL PRIMARY KEY,
             user_id BIGINT NOT NULL,
-            type TEXT NOT NULL,
-            category TEXT,
+            type TEXT NOT NULL,       -- 'income' или 'expense'
+            category TEXT,            -- NULL для дохода
             amount NUMERIC(12,2) NOT NULL,
             description TEXT,
             created_at TIMESTAMPTZ NOT NULL
         )
         """
     )
-
-    # Таблица с разрешёнными пользователями
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS allowed_users (
-            id BIGSERIAL PRIMARY KEY,
-            user_id BIGINT UNIQUE NOT NULL,
-            username TEXT,
-            first_name TEXT,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-        """
-    )
-
     conn.commit()
     conn.close()
 
 
-# -------------------------------------------------------------
-# РАБОТА С БАЗОЙ
-# -------------------------------------------------------------
-def add_record(user_id, type_, amount, description, category=None):
+def add_record(
+    user_id: int,
+    type_: str,
+    amount: float,
+    description: str,
+    category: str | None = None,
+):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
@@ -122,60 +104,23 @@ def add_record(user_id, type_, amount, description, category=None):
     conn.close()
 
 
-def is_user_allowed(user_id: int) -> bool:
-    if OWNER_ID and user_id == OWNER_ID:
-        return True
-
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT 1 FROM allowed_users WHERE user_id = %s", (user_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row is not None
-
-
-def add_allowed_user(user_id, username, first_name):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO allowed_users (user_id, username, first_name)
-        VALUES (%s, %s, %s)
-        ON CONFLICT (user_id) DO UPDATE
-        SET username = EXCLUDED.username,
-            first_name = EXCLUDED.first_name
-        """,
-        (user_id, username, first_name),
-    )
-    conn.commit()
-    conn.close()
-
-
-def remove_allowed_user(user_id):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM allowed_users WHERE user_id = %s", (user_id,))
-    conn.commit()
-    conn.close()
-
-
-def get_stats(user_id, date_from=None, date_to=None):
+def get_stats(user_id: int, date_from: datetime | None, date_to: datetime | None):
     conn = get_conn()
     cur = conn.cursor()
 
-    params = [user_id]
-    where = ["user_id = %s"]
+    params: list[object] = [user_id]
+    where_parts = ["user_id = %s"]
 
-    if date_from:
-        where.append("created_at >= %s")
+    if date_from is not None:
+        where_parts.append("created_at >= %s")
         params.append(date_from)
-    if date_to:
-        where.append("created_at < %s")
+    if date_to is not None:
+        where_parts.append("created_at < %s")
         params.append(date_to)
 
-    where_clause = " AND ".join(where)
+    where_clause = " AND ".join(where_parts)
 
-    # Доход/расход
+    # суммы доход/расход
     cur.execute(
         f"""
         SELECT type, SUM(amount)
@@ -187,7 +132,7 @@ def get_stats(user_id, date_from=None, date_to=None):
     )
     sums = {row[0]: float(row[1]) for row in cur.fetchall()}
 
-    # Категории
+    # расходы по категориям
     cur.execute(
         f"""
         SELECT category, SUM(amount)
@@ -204,255 +149,254 @@ def get_stats(user_id, date_from=None, date_to=None):
 
 
 # -------------------------------------------------------------
-# ПРОВЕРКА ДОСТУПА
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # -------------------------------------------------------------
-async def ensure_authorized(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    user = update.effective_user
-    if not user:
-        return False
-
-    user_id = user.id
-
-    if user_id == OWNER_ID:
-        return True
-
-    if is_user_allowed(user_id):
-        return True
-
-    await update.message.reply_text("❌ У вас нет доступа к этому боту.")
-
-    # Уведомление владельца
-    if OWNER_ID:
-        try:
-            username = f"@{user.username}" if user.username else "(нет username)"
-            await context.bot.send_message(
-                OWNER_ID,
-                f"🚪 Запрос доступа:\nID: {user_id}\nИмя: {user.first_name}\nUsername: {username}",
-            )
-        except:
-            pass
-
-    return False
-
-
-# -------------------------------------------------------------
-# ХЕЛПЕРЫ
-# -------------------------------------------------------------
-def build_category_keyboard():
-    rows = []
-    for cat in EXPENSE_CATEGORIES:
-        rows.append([f"{CATEGORY_EMOJI[cat]} {cat}"])
+def build_category_keyboard() -> ReplyKeyboardMarkup:
+    rows = [[f"{CATEGORY_EMOJI[cat]} {cat}"] for cat in EXPENSE_CATEGORIES]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, one_time_keyboard=True)
 
 
 def extract_category(text: str) -> str | None:
+    text = text.strip()
     for cat in EXPENSE_CATEGORIES:
         if cat in text:
             return cat
     return None
 
 
-def parse_month(text: str):
-    # Формат ММ-ГГ
+def parse_month_mm_yy(text: str) -> tuple[int, int]:
+    """
+    Формат ММ-ГГ (11-25 -> ноябрь 2025)
+    """
     try:
-        mm, yy = text.split("-")
-        mm = int(mm)
-        yy = int(yy)
+        mm_str, yy_str = text.split("-")
+        mm = int(mm_str)
+        yy = int(yy_str)
         if not 1 <= mm <= 12:
             raise ValueError
-        year = 2000 + yy
+        year = 2000 + yy  # считаем, что всё в 2000-х
         return year, mm
-    except:
+    except Exception:
         raise ValueError("Неверный формат")
 
 
+def get_current_month_range() -> tuple[datetime, datetime]:
+    today = date.today()
+    first = today.replace(day=1)
+    if first.month == 12:
+        next_month = first.replace(year=first.year + 1, month=1, day=1)
+    else:
+        next_month = first.replace(month=first.month + 1, day=1)
+    return (
+        datetime.combine(first, datetime.min.time()),
+        datetime.combine(next_month, datetime.min.time()),
+    )
+
+
 # -------------------------------------------------------------
-# ХЕНДЛЕРЫ
+# ХЭНДЛЕРЫ
 # -------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await ensure_authorized(update, context):
-        return
-
     kb = [["➕ Доход", "➖ Расход"], ["📊 Статистика"]]
     await update.message.reply_text(
-        "Привет! Я бот для учёта доходов и расходов.",
+        "Привет! Я бот для учёта доходов и расходов.\n\n"
+        "Используй кнопки ниже:",
         reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True),
     )
 
 
-# ДОХОД
-async def income_start(update, context):
-    if not await ensure_authorized(update, context):
-        return
-    await update.message.reply_text("Введи сумму дохода:", reply_markup=ReplyKeyboardRemove())
+# ---------- ДОХОД ----------
+async def income_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Введи сумму дохода (например: 1500.50):",
+        reply_markup=ReplyKeyboardRemove(),
+    )
     return INCOME_AMOUNT
 
 
-async def income_amount(update, context):
+async def income_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip().replace(",", ".")
     try:
-        amount = float(update.message.text.replace(",", "."))
-    except:
-        await update.message.reply_text("Введи число:")
+        amount = float(text)
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("Некорректная сумма. Введи положительное число:")
         return INCOME_AMOUNT
 
     context.user_data["income_amount"] = amount
-    await update.message.reply_text("Введите описание дохода:")
+    await update.message.reply_text("За что ты получил этот доход? (описание)")
     return INCOME_DESC
 
 
-async def income_desc(update, context):
-    amount = context.user_data["income_amount"]
-    desc = update.message.text
-    uid = update.effective_user.id
+async def income_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    desc = update.message.text.strip()
+    amount = context.user_data.get("income_amount")
+    user_id = update.effective_user.id
 
-    add_record(uid, "income", amount, desc)
+    add_record(user_id, "income", amount, desc)
 
     kb = [["➕ Доход", "➖ Расход"], ["📊 Статистика"]]
     await update.message.reply_text(
-        f"Доход {amount:.2f} ₽ сохранён.",
+        f"✅ Доход {amount:.2f} ₽ сохранён.\nОписание: {desc}",
         reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True),
     )
-
+    context.user_data.pop("income_amount", None)
     return ConversationHandler.END
 
 
-# РАСХОД
-async def expense_start(update, context):
-    if not await ensure_authorized(update, context):
-        return
-    await update.message.reply_text("Выбери категорию:", reply_markup=build_category_keyboard())
+# ---------- РАСХОД ----------
+async def expense_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Выбери категорию расхода:",
+        reply_markup=build_category_keyboard(),
+    )
     return EXPENSE_CATEGORY
 
 
-async def expense_category(update, context):
+async def expense_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cat = extract_category(update.message.text)
-    if not cat:
-        await update.message.reply_text("Выберите категорию с кнопки.")
+    if cat is None:
+        await update.message.reply_text("Пожалуйста, выбери категорию с клавиатуры.")
         return EXPENSE_CATEGORY
 
     context.user_data["expense_category"] = cat
-    await update.message.reply_text("Введите сумму:", reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text(
+        f"Категория: {CATEGORY_EMOJI[cat]} {cat}\nТеперь введи сумму расхода:",
+        reply_markup=ReplyKeyboardRemove(),
+    )
     return EXPENSE_AMOUNT
 
 
-async def expense_amount(update, context):
+async def expense_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip().replace(",", ".")
     try:
-        amount = float(update.message.text.replace(",", "."))
-    except:
-        await update.message.reply_text("Введите число:")
+        amount = float(text)
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("Некорректная сумма. Введи положительное число:")
         return EXPENSE_AMOUNT
 
     context.user_data["expense_amount"] = amount
-    await update.message.reply_text("Введите описание:")
+    await update.message.reply_text(
+        "Напиши комментарий: за что потратил?\nНапример: продукты, аренда, кино..."
+    )
     return EXPENSE_DESC
 
 
-async def expense_desc(update, context):
-    cat = context.user_data["expense_category"]
-    amount = context.user_data["expense_amount"]
-    desc = update.message.text
-    uid = update.effective_user.id
+async def expense_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    desc = update.message.text.strip()
+    amount = context.user_data.get("expense_amount")
+    category = context.user_data.get("expense_category")
+    user_id = update.effective_user.id
 
-    add_record(uid, "expense", amount, desc, cat)
+    add_record(user_id, "expense", amount, desc, category)
 
     kb = [["➕ Доход", "➖ Расход"], ["📊 Статистика"]]
     await update.message.reply_text(
-        f"Расход {amount:.2f} ₽ сохранён.",
+        f"✅ Расход {amount:.2f} ₽ сохранён.\n"
+        f"Категория: {CATEGORY_EMOJI[category]} {category}\n"
+        f"Комментарий: {desc}",
         reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True),
     )
 
+    context.user_data.pop("expense_amount", None)
+    context.user_data.pop("expense_category", None)
     return ConversationHandler.END
 
 
-# СТАТИСТИКА
-async def stats_start(update, context):
-    if not await ensure_authorized(update, context):
-        return
-
+# ---------- СТАТИСТИКА ----------
+async def stats_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [["Текущий месяц", "Выбрать месяц"], ["За всё время"]]
     await update.message.reply_text(
-        "Выберите период:",
-        reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True),
+        "За какой период показать статистику?",
+        reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True, one_time_keyboard=True),
     )
     return STATS_PERIOD
 
 
-async def stats_period(update, context):
-    choice = update.message.text
-    uid = update.effective_user.id
+async def stats_period(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    choice = update.message.text.strip()
+    user_id = update.effective_user.id
 
     if choice == "Текущий месяц":
-        today = date.today()
-        first = today.replace(day=1)
-        nextm = date(first.year + (first.month == 12), (first.month % 12) + 1, 1)
-        sums, cats = get_stats(uid, datetime.combine(first, datetime.min.time()),
-                               datetime.combine(nextm, datetime.min.time()))
+        date_from, date_to = get_current_month_range()
+        sums, cats = get_stats(user_id, date_from, date_to)
         await send_stats(update, sums, cats, "Текущий месяц")
         return ConversationHandler.END
 
-    elif choice == "За всё время":
-        sums, cats = get_stats(uid, None, None)
+    if choice == "За всё время":
+        sums, cats = get_stats(user_id, None, None)
         await send_stats(update, sums, cats, "За всё время")
         return ConversationHandler.END
 
-    elif choice == "Выбрать месяц":
-        await update.message.reply_text("Введите месяц в формате ММ-ГГ (например 11-25):",
-                                        reply_markup=ReplyKeyboardRemove())
+    if choice == "Выбрать месяц":
+        await update.message.reply_text(
+            "Введи месяц в формате ММ-ГГ (например 11-25):",
+            reply_markup=ReplyKeyboardRemove(),
+        )
         return STATS_CUSTOM_MONTH
 
-    else:
-        await update.message.reply_text("Выберите вариант с кнопки.")
-        return STATS_PERIOD
+    await update.message.reply_text("Пожалуйста, выбери вариант с клавиатуры.")
+    return STATS_PERIOD
 
 
-async def stats_custom_month(update, context):
+async def stats_custom_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
     try:
-        year, month = parse_month(update.message.text)
-    except:
-        await update.message.reply_text("Формат должен быть ММ-ГГ.")
+        year, month = parse_month_mm_yy(text)
+    except ValueError:
+        await update.message.reply_text("Неверный формат. Нужен ММ-ГГ, например 11-25.")
         return STATS_CUSTOM_MONTH
 
-    uid = update.effective_user.id
+    user_id = update.effective_user.id
     first = date(year, month, 1)
-    nextm = date(first.year + (first.month == 12), (first.month % 12) + 1, 1)
+    if month == 12:
+        next_month = date(year + 1, 1, 1)
+    else:
+        next_month = date(year, month + 1, 1)
 
-    sums, cats = get_stats(
-        uid,
-        datetime.combine(first, datetime.min.time()),
-        datetime.combine(nextm, datetime.min.time())
-    )
+    date_from = datetime.combine(first, datetime.min.time())
+    date_to = datetime.combine(next_month, datetime.min.time())
 
-    await send_stats(update, sums, cats, f"{month:02d}-{str(year)[-2:]}")
+    sums, cats = get_stats(user_id, date_from, date_to)
+    await send_stats(update, sums, cats, f"Месяц {month:02d}-{str(year)[-2:]}")
     return ConversationHandler.END
 
 
-async def send_stats(update, sums, cats, period):
-    income = sums.get("income", 0)
-    expense = sums.get("expense", 0)
+async def send_stats(
+    update: Update,
+    sums: dict,
+    cats: dict,
+    period_label: str,
+):
+    income = sums.get("income", 0.0)
+    expense = sums.get("expense", 0.0)
     balance = income - expense
 
-    nz = cats.get("НЗ", 0)
-    other = {k: v for k, v in cats.items() if k != "НЗ"}
+    nz_amount = cats.get("НЗ", 0.0)
+    other_cats = {k: v for k, v in cats.items() if k != "НЗ"}
 
-    lines = [
-        f"📊 Статистика: {period}",
+    lines: list[str] = [
+        f"📊 Статистика: {period_label}",
         "",
         f"Доход: {income:.2f} ₽",
         f"Расход: {expense:.2f} ₽",
         f"Баланс: {balance:.2f} ₽",
     ]
 
-    if other:
+    if other_cats:
         lines.append("")
         lines.append("Расходы по категориям:")
-        for c, a in other.items():
-            emoji = CATEGORY_EMOJI[c]
-            lines.append(f"• {emoji} {c}: {a:.2f} ₽")
+        for cat, amt in other_cats.items():
+            emoji = CATEGORY_EMOJI.get(cat, "")
+            lines.append(f"• {emoji} {cat}: {amt:.2f} ₽")
 
-    if nz:
+    if nz_amount:
         lines.append("")
         lines.append("НЗ (Запас):")
-        lines.append(f"• {CATEGORY_EMOJI['НЗ']} НЗ: {nz:.2f} ₽")
+        lines.append(f"• {CATEGORY_EMOJI['НЗ']} НЗ: {nz_amount:.2f} ₽")
 
     kb = [["➕ Доход", "➖ Расход"], ["📊 Статистика"]]
     await update.message.reply_text(
@@ -461,56 +405,8 @@ async def send_stats(update, sums, cats, period):
     )
 
 
-# -------------------------------------------------------------
-# КОМАНДЫ ДОСТУПА
-# -------------------------------------------------------------
-async def grant(update, context):
-    if update.effective_user.id != OWNER_ID:
-        await update.message.reply_text("Команда только для владельца.")
-        return
-
-    if not context.args:
-        await update.message.reply_text("Использование: /grant <user_id>")
-        return
-
-    try:
-        uid = int(context.args[0])
-    except:
-        await update.message.reply_text("user_id должен быть числом.")
-        return
-
-    add_allowed_user(uid, None, None)
-    await update.message.reply_text(f"Пользователь {uid} добавлен.")
-
-
-async def revoke(update, context):
-    if update.effective_user.id != OWNER_ID:
-        await update.message.reply_text("Команда только для владельца.")
-        return
-
-    if not context.args:
-        await update.message.reply_text("Использование: /revoke <user_id>")
-        return
-
-    try:
-        uid = int(context.args[0])
-    except:
-        await update.message.reply_text("user_id должен быть числом.")
-        return
-
-    remove_allowed_user(uid)
-    await update.message.reply_text(f"Пользователь {uid} удалён.")
-
-
-async def myid(update, context):
-    await update.message.reply_text(f"Ваш Telegram ID: `{update.effective_user.id}`",
-                                    parse_mode="Markdown")
-
-
-# -------------------------------------------------------------
-# ОТМЕНА
-# -------------------------------------------------------------
-async def cancel(update, context):
+# ---------- ОТМЕНА ----------
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [["➕ Доход", "➖ Расход"], ["📊 Статистика"]]
     await update.message.reply_text(
         "Действие отменено.",
@@ -527,12 +423,15 @@ def main():
 
     token = os.getenv("BOT_TOKEN")
     if not token:
-        raise RuntimeError("Не найден BOT_TOKEN")
+        raise RuntimeError("Не задан BOT_TOKEN")
 
     app = ApplicationBuilder().token(token).build()
 
     income_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^➕ Доход$"), income_start)],
+        entry_points=[
+            MessageHandler(filters.Regex("^➕ Доход$"), income_start),
+            CommandHandler("income", income_start),
+        ],
         states={
             INCOME_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, income_amount)],
             INCOME_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, income_desc)],
@@ -541,7 +440,10 @@ def main():
     )
 
     expense_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^➖ Расход$"), expense_start)],
+        entry_points=[
+            MessageHandler(filters.Regex("^➖ Расход$"), expense_start),
+            CommandHandler("expense", expense_start),
+        ],
         states={
             EXPENSE_CATEGORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, expense_category)],
             EXPENSE_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, expense_amount)],
@@ -551,7 +453,10 @@ def main():
     )
 
     stats_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^📊 Статистика$"), stats_start)],
+        entry_points=[
+            MessageHandler(filters.Regex("^📊 Статистика$"), stats_start),
+            CommandHandler("stats", stats_start),
+        ],
         states={
             STATS_PERIOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, stats_period)],
             STATS_CUSTOM_MONTH: [MessageHandler(filters.TEXT & ~filters.COMMAND, stats_custom_month)],
@@ -560,10 +465,6 @@ def main():
     )
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("grant", grant))
-    app.add_handler(CommandHandler("revoke", revoke))
-    app.add_handler(CommandHandler("myid", myid))
-
     app.add_handler(income_conv)
     app.add_handler(expense_conv)
     app.add_handler(stats_conv)
@@ -573,4 +474,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
