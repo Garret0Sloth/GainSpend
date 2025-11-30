@@ -41,13 +41,16 @@ logger = logging.getLogger(__name__)
 # -------------------------------------------------------------
 # КАТЕГОРИИ И ЭМОДЗИ
 # -------------------------------------------------------------
-EXPENSE_CATEGORIES = ["Еда", "Дом", "Коммуналка", "Досуг", "НЗ"]
+EXPENSE_CATEGORIES = ["Еда", "Дом", "Коммуналка", "Досуг", "Коты", "Разное", "НЗ"]
+
 
 CATEGORY_EMOJI = {
     "Еда": "🍽️",
     "Дом": "🏠",
     "Коммуналка": "💡",
     "Досуг": "🎉",
+    "Коты": "🐾",
+    "Разное": "📍",
     "НЗ": "📦",
 }
 
@@ -568,16 +571,15 @@ async def send_detailed_stats(
     expenses_by_cat: dict[str | None, list[str]] = {}
 
     for type_, category, amount, desc, created_at in rows:
-        date_str = created_at.strftime("%Y-%m-%d")
-        if type_ == "income":
-            incomes.append(f"• {date_str} — {amount:.2f} ₽ — {desc}")
-        else:
-            expenses_by_cat.setdefault(category, []).append(
-                f"• {date_str} — {amount:.2f} ₽ — {desc}"
-            )
+    date_str = created_at.strftime("%d.%m.%y")
+    line = f"{date_str} • {amount:.2f} ₽ • {desc}"
+
+    if type_ == "income":
+        incomes.append(line)
+    else:
+        expenses_by_cat.setdefault(category, []).append(line)
 
     lines: list[str] = [f"📋 Детальная статистика: {period_label}", ""]
-
     if incomes:
         lines.append("Доходы:")
         lines.extend(incomes)
