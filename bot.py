@@ -571,13 +571,13 @@ async def send_detailed_stats(
     expenses_by_cat: dict[str | None, list[str]] = {}
 
     for type_, category, amount, desc, created_at in rows:
-    date_str = created_at.strftime("%d.%m.%y")
-    line = f"{date_str} • {amount:.2f} ₽ • {desc}"
+        date_str = created_at.strftime("%d.%m.%y")
+        line = f"{date_str} • {amount:.2f} ₽ • {desc}"
 
-    if type_ == "income":
-        incomes.append(line)
-    else:
-        expenses_by_cat.setdefault(category, []).append(line)
+        if type_ == "income":
+            incomes.append(line)
+        else:
+            expenses_by_cat.setdefault(category, []).append(line)
 
     lines: list[str] = [f"📋 Детальная статистика: {period_label}", ""]
     if incomes:
